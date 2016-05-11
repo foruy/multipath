@@ -48,6 +48,9 @@
 #include <net/ip6_checksum.h>
 #endif
 
+#include <linux/genetlink.h>
+#include <net/genetlink.h>
+
 #define VXLAN_VERSION	"0.1"
 
 #define PORT_HASH_BITS	8
@@ -155,6 +158,27 @@ struct vxlan_dev {
 #define VXLAN_F_L2MISS	0x08
 #define VXLAN_F_L3MISS	0x10
 #define VXLAN_F_IPV6	0x20 /* internal flag */
+
+enum {
+        CG_ATTR_UNSPEC,
+        CG_ATTR_PID,
+        CG_ATTR_PACKET,
+        __CG_ATTR_MAX,
+};
+
+#define CG_ATTR_MAX (__CG_ATTR_MAX - 1)
+
+enum commands {
+        CG_CMD_UNSPEC,
+        CG_CMD_PID,
+        CG_CMD_PACKET,
+        __CG_CMD_MAX,
+};
+#define CG_CMD_MAX (__CG_CMD_MAX - 1)
+
+static pid_t pid;
+int send_upcall(void *, int, enum commands);
+
 
 /* salt for hash table */
 static u32 vxlan_salt __read_mostly;
@@ -436,7 +460,7 @@ static void vxlan_ip_miss(struct net_device *dev, union vxlan_addr *ipa)
 	vxlan_fdb_notify(vxlan, &f, RTM_GETNEIGH);
 }
 
-static void vxlan_fdb_miss(struct vxlan_dev *vxlan, const u8 eth_addr[ETH_ALEN])
+/*static void vxlan_fdb_miss(struct vxlan_dev *vxlan, const u8 eth_addr[ETH_ALEN])
 {
 	struct vxlan_fdb f = {
 		.state = NUD_STALE,
@@ -446,7 +470,7 @@ static void vxlan_fdb_miss(struct vxlan_dev *vxlan, const u8 eth_addr[ETH_ALEN])
 	memcpy(f.eth_addr, eth_addr, ETH_ALEN);
 
 	vxlan_fdb_notify(vxlan, &f, RTM_GETNEIGH);
-}
+}*/
 
 /* Hash Ethernet address */
 static u32 eth_hash(const unsigned char *addr)
@@ -1209,11 +1233,11 @@ struct devpair remote_pairs[] = {
 
 struct devpair local_pairs[] = {
     {
-     .addr = 2886730035,
+     .addr = 2886730037,
      .valid = true,
     },
     {
-     .addr = 2886730291,
+     .addr = 2886730293,
      .valid = true,
     },
 };
@@ -1225,15 +1249,25 @@ struct padding {
     __be32 totlen;
 };
 
-struct packet {
+struct packet_list {
     struct hlist_head buf_list[MAX_SIZE];
     struct timer_list buf_timer;
     spinlock_t buf_lock;
 };
 
+#define MAX_BUF_SIZE 2000
+
+struct packet {
+	__u32 id;
+	__u32 ifindex;
+	__u16 len;
+	bool enc;
+	char data[MAX_BUF_SIZE];
+};
+
 struct buffer {
     struct hlist_node hlist;
-    char data[2048];
+    char data[MAX_BUF_SIZE];
     u16 len;
     unsigned long update;
     struct padding pad;
@@ -1244,19 +1278,19 @@ struct full_buffer {
     u32 size;
 };
 
-struct packet ptable;
+struct packet_list ptable;
 
-static struct hlist_head *buf_head(struct packet *pt, u16 id)
+static struct hlist_head *buf_head(struct packet_list *pt, u16 id)
 {
     return &pt->buf_list[id];
 }
 
-static int buf_get(struct packet *pt, struct full_buffer *fbuf, u16 id, u32 *totlen)
+static int buf_get(struct packet_list *pt, struct full_buffer *fbuf, u16 id, u32 *totlen)
 {
     int count = 0;
     struct buffer *b;
     hlist_for_each_entry_rcu(b, buf_head(pt, id), hlist) {
-        if (b->pad.id == id) {
+        if ((b->pad.id & 0x0000ffff) == id) {
             struct full_buffer fb;
             if (b->pad.offset > (SPLIT + 1))
                 return 0;
@@ -1275,7 +1309,7 @@ static int buf_get(struct packet *pt, struct full_buffer *fbuf, u16 id, u32 *tot
     return 0;
 }
 
-static void buf_delete(struct packet *pt, u16 id)
+static void buf_delete(struct packet_list *pt, u16 id)
 {
     struct hlist_node *p, *n; 
     hlist_for_each_safe(p, n, buf_head(pt, id)) { 
@@ -1288,7 +1322,7 @@ static void buf_delete(struct packet *pt, u16 id)
 static void buf_cleanup(unsigned long arg)
 {
     unsigned int h;
-    struct packet *pt = (struct packet *) arg;
+    struct packet_list *pt = (struct packet_list *) arg;
     spin_lock_bh(&pt->buf_lock);
     for (h = 0; h < MAX_SIZE; ++h) {
         struct hlist_node *p, *n;
@@ -1305,36 +1339,54 @@ static void buf_cleanup(unsigned long arg)
 }
 
 static void recombine(struct sk_buff *old_skb, struct vxlan_dev *vxlan,
-                      struct full_buffer *fbuf, u16 id, int count, u32 totlen)
+                      struct full_buffer *fbuf, u32 id, int count, u32 totlen)
 {
-    int i;
+	int i;
+	struct packet pack;
+
+	memset(&pack, 0, sizeof(pack));
+
+    for (i = 0; i < count; ++i) {
+	memcpy(pack.data + pack.len, fbuf[i].data, fbuf[i].size);
+	pack.len += fbuf[i].size;
+    }
+
+	if (pack.len == totlen) {
+		pack.id = id;
+		pack.enc = false;
+		pack.ifindex = vxlan->dev->ifindex;
+
+		send_upcall((void *) &pack, sizeof(pack), CG_CMD_PACKET);
+	}
+}
+
+static int _vxlan_rcv_one(struct net_device *dev, struct packet *pack)
+{
     struct iphdr *oip = NULL;
     struct ipv6hdr *oip6 = NULL;
     struct pcpu_sw_netstats *stats;
     union vxlan_addr saddr;
     union vxlan_addr *remote_ip;
     struct sk_buff *skb;
+	struct vxlan_dev *vxlan = netdev_priv(dev);
 
-    skb = alloc_skb(totlen, GFP_ATOMIC);
+    skb = alloc_skb(pack->len, GFP_ATOMIC);
     if (skb == NULL) {
         pr_warn("Allocated new skb failed.\n");
-        goto err;
+        return -ENOMEM;
     }
 
-    for (i = 0; i < count; ++i) {
-        skb_copy_to_linear_data_offset(skb, skb->len, fbuf[i].data, fbuf[i].size);
-        skb->len += fbuf[i].size;
-    }
+	skb_copy_to_linear_data(skb, pack->data, pack->len);
+	skb->len = pack->len;
 
     remote_ip = &vxlan->default_dst.remote_ip;
     skb_reset_mac_header(skb);
-    pr_warn("New skb len=%u.\n", skb->len);
     skb->protocol = eth_type_trans(skb, vxlan->dev);
 
     /* Ignore packet loops (and multicast echo) */
     if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr)) {
         kfree_skb(skb);
-        goto err;
+        return -EINVAL;
     }
 
     /* Re-examine inner Ethernet packet */
@@ -1367,11 +1419,11 @@ static void recombine(struct sk_buff *old_skb, struct vxlan_dev *vxlan,
     u64_stats_update_end(&stats->syncp);
 
     netif_rx(skb);
-err:
-    buf_delete(&ptable, id);
+
+	return 0;
 }
 
-static void _vxlan_rcv(struct packet *pt, struct sk_buff *skb,
+static void _vxlan_rcv(struct packet_list *pt, struct sk_buff *skb,
                        struct vxlan_dev *vxlan, struct padding *pad)
 {
     int count;
@@ -1399,8 +1451,10 @@ static void _vxlan_rcv(struct packet *pt, struct sk_buff *skb,
     count = buf_get(pt, fbuf, pad->id, &totlen);
     spin_unlock_bh(&pt->buf_lock);
 
-    if (count > 0 && totlen > 0)
+    if (count > 0 && totlen > 0) {
         recombine(skb, vxlan, fbuf, pad->id, count, totlen);
+	buf_delete(&ptable, pad->id);
+	}
 }
 /********************wwx end*********************/
 
@@ -1416,20 +1470,24 @@ static void vxlan_rcv(struct vxlan_sock *vs,
 	int err = 0;
 	union vxlan_addr *remote_ip;
 
+	struct padding *pad; // split padding
+
 	vni = ntohl(vx_vni) >> 8;
-        if (vni == 0) {
-            vni = 10;
-            if (!pskb_may_pull(skb, ST_SIZE(padding) + 1)) {
-                goto drop;
-            }
+
+        if (!pskb_may_pull(skb, ST_SIZE(padding) + 1)) {
+        	goto drop;
+        }
+
+        pad = (struct padding *) skb->data;
+	if (pad->totlen == VXLAN_FLAGS) {
 	    vxlan = vxlan_vs_find_vni(vs, vni);
 	    if (!vxlan)
 		goto drop;
+
 	    remote_ip = &vxlan->default_dst.remote_ip;
 	    if (remote_ip->sa.sa_family == AF_INET) {
-                struct padding *pad = (struct padding *) skb->data;
                 skb_pull(skb, ST_SIZE(padding));
-                pr_warn("Receive: skblen=%u,id=%u,ost=%u,totlen=%u\n", skb->len, pad->id, pad->offset, pad->totlen);
+                pr_warn("Receive: skblen=%u,id=%u,ost=%u\n", skb->len, pad->id, pad->offset);
                 _vxlan_rcv(&ptable, skb, vxlan, pad);
                 goto drop;
             }
@@ -2075,9 +2133,8 @@ empty:
     return NULL;
 }
 
-int _vxlan_xmit_skb(struct vxlan_dev *vxlan, struct sk_buff *old_skb,
-                    __u8 tos, __u8 ttl, __be16 df, __be16 src_port,
-                    __be16 dst_port, __be32 vni, unsigned char *buf,
+int _vxlan_xmit_skb(struct vxlan_dev *vxlan, __u8 tos, __u8 ttl, __be16 df,
+		    __be16 src_port, __be16 dst_port, __be32 vni, unsigned char *buf,
                     __be32 id, __be32 ost, __be32 block, int len)
 {
     struct sk_buff *skb;
@@ -2092,14 +2149,14 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, struct sk_buff *old_skb,
     memset(&fl4, 0, sizeof(fl4));
     rt = rt_select(sock_net(vxlan->vn_sock->sock->sk), &fl4, ost);
     if (IS_ERR(rt) || rt == NULL) {
-        netdev_dbg(old_skb->dev, "no route to %pI4\n", &fl4.daddr);
-        old_skb->dev->stats.tx_carrier_errors++;
+        netdev_dbg(vxlan->dev, "no route to %pI4\n", &fl4.daddr);
+        vxlan->dev->stats.tx_carrier_errors++;
         goto drop;
     }
 
-    if (rt->dst.dev == old_skb->dev) {
-        netdev_dbg(old_skb->dev, "circular route to %pI4\n", &fl4.saddr);
-        old_skb->dev->stats.collisions++;
+    if (rt->dst.dev == vxlan->dev) {
+        netdev_dbg(vxlan->dev, "circular route to %pI4\n", &fl4.saddr);
+        vxlan->dev->stats.collisions++;
         goto rt_tx_error;
     }
 
@@ -2123,7 +2180,7 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, struct sk_buff *old_skb,
     pad->id = id;
     pad->offset = ost;
     pad->block = block;
-    pad->totlen = old_skb->len;
+    pad->totlen = VXLAN_FLAGS;
 
     vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
     vxh->vx_flags = htonl(VXLAN_FLAGS);
@@ -2137,14 +2194,14 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, struct sk_buff *old_skb,
     uh->len = htons(skb->len);
     uh->check = 0;
 
-    skb->dev = old_skb->dev;
+    skb->dev = vxlan->dev;
     if (skb->len < 0 || handle_offloads(skb)) {
         goto tx_free;
     }
                 ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
 
 
-pr_warn("Send id=%u,ost=%u,len=%u,padlen=%u,skblen=%u\n", id, ost, len, old_skb->len, skb->len);
+	pr_warn("Send id=%u,ost=%u,len=%u,skblen=%u\n", id, ost, len, skb->len);
     err = iptunnel_xmit(rt, skb, fl4.saddr, fl4.daddr, IPPROTO_UDP, tos, ttl, df, false);
     if (err >= 0)
         goto drop;
@@ -2157,40 +2214,106 @@ drop:
     return err;
 }
 
-static void _vxlan_xmit_one(struct sk_buff *skb, struct vxlan_dev *vxlan,
-                            __u8 tos, __u8 ttl, __be16 df,
-                            __be16 src_port, __be16 dst_port)
+static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev)
 {
-    unsigned char *buf, data[2000];
-    int len, ret = 0;
-    __be32 id, ost, block = SPLIT;
-    __be32 vni = htonl(CG_VNI << 8);
-    int _div = skb->len / block;
-    int _mod = skb->len % block;
+	u32 id;
+	struct packet pack;
 
-    //buf = (unsigned char *) skb->data;
-    memset(data, 0, sizeof(data));
-    if (skb->len > sizeof(data) || skb_copy_bits(skb, 0, data, skb->len) < 0)
-        return;
-    buf = data;
+	memset(&pack, 0, sizeof(pack));
+	if (skb->len > sizeof(pack.data) || skb_copy_bits(skb, 0, pack.data, skb->len) < 0)
+		return;
 
-    get_random_bytes(&id, sizeof(u16));
-    id = 0x0000ffff & id;
+	get_random_bytes(&id, sizeof(u32));
 
-    for (ost = 1; ost <= block; ost++) {
-        if (ost == block && _mod > 0)
-            len = _div + _mod;
-        else
-            len = _div;
+	pack.id = id;
+	pack.len = skb->len;
+	pack.enc = true;
+	pack.ifindex = dev->ifindex;
 
-        ret = _vxlan_xmit_skb(vxlan, skb, tos, ttl, df, src_port, dst_port,
-                              vni, buf, id, ost, block, len);
+	send_upcall((void *) &pack, sizeof(pack), CG_CMD_PACKET);
+}
 
-        if (ret < 0 || (ost == block))
-            break;
+/* copy from vxlan_src_port */
+__be16 packet_src_port(__u16 port_min, __u16 port_max, struct packet *pack)
+{
+	unsigned int range = (port_max - port_min) + 1;
+	u32 hash = jhash(pack->data, 2 * ETH_ALEN, ((__force u32) pack->id));
+	return htons((((u64) hash * range) >> 32) + port_min);
+}
 
-        buf += len;
-    }
+static int _vxlan_xmit_one(struct net_device *dev, struct packet *pack)
+{
+	struct vxlan_dev *vxlan = netdev_priv(dev);
+	struct vxlan_rdst *rdst = NULL;
+	__be16 src_port = 0, dst_port;
+	u32 vni;
+	__be16 df = 0;
+	__u8 tos, ttl;
+
+	int len, ret;
+	unsigned char *buf;
+	__be32 ost, block = SPLIT;
+	int _div = pack->len / block;
+	int _mod = pack->len % block;
+
+	if (!vxlan)
+		return -EINVAL;
+
+	rdst = &vxlan->default_dst;
+	dst_port = rdst->remote_port ? rdst->remote_port : vxlan->dst_port;
+	vni = htonl(rdst->remote_vni << 8);
+	ttl = vxlan->ttl;
+
+	if (!ttl && vxlan_addr_multicast(&rdst->remote_ip))
+		ttl = 1;
+
+	tos = vxlan->tos;
+	src_port = packet_src_port(vxlan->port_min, vxlan->port_max, pack);
+
+	buf = (unsigned char *) pack->data;
+	for (ost = 1; ost <= block; ost++) {
+		if (ost == block && _mod > 0)
+			len = _div + _mod;
+		else
+			len = _div;
+
+		ret = _vxlan_xmit_skb(vxlan, tos, ttl, df, src_port, dst_port,
+				vni, buf, pack->id, ost, block, len);
+
+		if (ret < 0 || (ost == block))
+			break;
+
+		buf += len;
+	}
+	return 0;
+}
+
+static int do_packet(struct sk_buff *skb, struct genl_info *info)
+{
+	int len, ret;
+	struct packet pack;
+	struct nlattr **a = info->attrs;
+	struct net_device *dev = NULL;
+
+	if (!a[CG_ATTR_PACKET]) {
+		return -EINVAL;
+	}
+
+	len = nla_len(a[CG_ATTR_PACKET]);
+	nla_memcpy(&pack, a[CG_ATTR_PACKET], len);
+
+	pr_warn("Enc=%d,id=%u,len=%u,ifidx=%u\n", pack.enc, pack.id, pack.len, pack.ifindex);
+
+	dev = __dev_get_by_index(&init_net, pack.ifindex);
+	if (!dev)
+		return -EADDRNOTAVAIL;
+
+	if (pack.enc)
+		ret = _vxlan_xmit_one(dev, &pack);
+	else
+		ret = _vxlan_rcv_one(dev, &pack);
+
+	return ret;
 }
 
 static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
@@ -2237,7 +2360,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 
 if (old_iph->protocol == IPPROTO_UDP ||
         old_iph->protocol == IPPROTO_TCP) {
-    _vxlan_xmit_one(skb, vxlan, tos, ttl, df, src_port, dst_port);
+    send_packet_to_user(skb, dev);
     goto tx_free;
 }
 
@@ -2247,7 +2370,7 @@ if (old_iph->protocol == IPPROTO_UDP ||
 		//fl4.daddr = dst->sin.sin_addr.s_addr;
 		//fl4.saddr = vxlan->saddr.sin.sin_addr.s_addr;
 		fl4.daddr = htonl(2886730038);
-		fl4.saddr = htonl(2886730035);
+		fl4.saddr = htonl(2886730037);
 
 		rt = ip_route_output_key(dev_net(dev), &fl4);
 		if (IS_ERR(rt)) {
@@ -2365,7 +2488,8 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct vxlan_dev *vxlan = netdev_priv(dev);
 	struct ethhdr *eth;
 	bool did_rsc = false;
-	struct vxlan_rdst *rdst, *fdst = NULL;
+	//struct vxlan_rdst *rdst, *fdst = NULL;
+	struct vxlan_rdst *fdst = NULL;
 	struct vxlan_fdb *f;
 
 fdst = &vxlan->default_dst;
@@ -3319,6 +3443,74 @@ static struct pernet_operations vxlan_net_ops = {
 	.size = sizeof(struct vxlan_net),
 };
 
+static int do_pid(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr **a = info->attrs;
+	pid = nla_get_u32(a[CG_ATTR_PID]);
+	if (!pid) {
+		return -EINVAL;
+	}
+	pr_warn("pid=%u\n", pid);
+	return 0;
+}
+
+static struct nla_policy cg_pid_policy[CG_ATTR_MAX + 1] = {
+        [CG_ATTR_PID] = { .type = NLA_U32 },
+};
+
+static struct nla_policy cg_packet_policy[CG_ATTR_MAX + 1] = {
+        [CG_ATTR_PACKET] = { .len = sizeof(struct packet) },
+};
+
+static struct genl_ops cg_gnl_ops[] = {
+        {
+                .cmd = CG_CMD_PID,
+                .flags = 0,
+                .policy = cg_pid_policy,
+                .doit = do_pid,
+                .dumpit = NULL,
+        },
+	{
+		.cmd = CG_CMD_PACKET,
+		.flags = 0,
+		.policy = cg_packet_policy,
+		.doit = do_packet,
+	},
+};
+
+static struct genl_family cg_family = {
+        .id = GENL_ID_GENERATE,
+        .hdrsize = 0,
+        .name = "CG",
+        .version = 1,
+        .maxattr = CG_ATTR_MAX,
+        .ops = cg_gnl_ops,
+        .n_ops = ARRAY_SIZE(cg_gnl_ops),
+};
+
+int send_upcall(void *data, int len, enum commands cmd)
+{
+        struct sk_buff *skb;
+        void *head;
+        int rc;
+        size_t size = nla_total_size(len);
+
+        skb = genlmsg_new(size, GFP_KERNEL);
+        if (skb == NULL)
+                return -ENOMEM;
+
+        genlmsg_put(skb, 0, 0, &cg_family, 0, cmd);
+        nla_put(skb, CG_ATTR_PACKET, len, data);
+        head = genlmsg_data(nlmsg_data(nlmsg_hdr(skb)));
+        genlmsg_end(skb, head);
+
+        rc = genlmsg_unicast(&init_net, skb, pid);
+        if (rc < 0)
+                return rc;
+
+        return 0;
+}
+
 static int __init vxlan_init_module(void)
 {
 	int rc;
@@ -3327,6 +3519,12 @@ static int __init vxlan_init_module(void)
 	vxlan_wq = alloc_workqueue("vxlan", 0, 0);
 	if (!vxlan_wq)
 		return -ENOMEM;
+
+	rc = genl_register_family(&cg_family);
+	if (rc) {
+                genl_unregister_family(&cg_family);
+		goto out1;
+	}
 
     spin_lock_init(&ptable.buf_lock);
     for (h = 0; h < MAX_SIZE; ++h)
@@ -3369,6 +3567,8 @@ static void __exit vxlan_cleanup_module(void)
 	destroy_workqueue(vxlan_wq);
 	unregister_pernet_subsys(&vxlan_net_ops);
 	/* rcu_barrier() is called by netns */
+
+        genl_unregister_family(&cg_family);
 
     del_timer_sync(&ptable.buf_timer);
     for (h = 0; h < MAX_SIZE; ++h)
