@@ -8,7 +8,7 @@
 
 #include "test.h"
 
-#define GENLMSG_DATA(glh) ((void *)(NLMSG_DATA(glh) + GENL_HDRLEN))
+#define GENLMSG_DATA(glh) ((void *)((char *)(NLMSG_DATA(glh)) + GENL_HDRLEN))
 #define NLA_DATA(na)      ((void *)((char *)(na) + NLA_HDRLEN))
 
 typedef struct nlmsg {
@@ -17,8 +17,8 @@ typedef struct nlmsg {
 	struct packet pack;
 } nlmsg;
 
-int genl_send_msg(int fd, u_int16_t nlmsg_type, u_int32_t nlmsg_pid,
-                  u_int8_t genl_cmd, u_int8_t genl_version, u_int16_t nla_type,
+int genl_send_msg(int fd, u16t nlmsg_type, u32t nlmsg_pid,
+                  byte genl_cmd, byte genl_version, u16t nla_type,
                   void *nla_data, int nla_len)
 {
     struct nlattr *na;
@@ -55,7 +55,7 @@ int genl_send_msg(int fd, u_int16_t nlmsg_type, u_int32_t nlmsg_pid,
     return 0;
 }
 
-static int get_fid(int fd, char *fname)
+static int get_fid(int fd, const char *fname)
 {
     nlmsg ans;
     int id = 0, rc;
@@ -82,13 +82,13 @@ ret:
     return id;
 }
 
-static int set_pid(int fd, u_int16_t fid)
+static int set_pid(int fd, u16t fid)
 {
-    u_int32_t pid = getpid();
-    return genl_send_msg(fd, fid, pid, CG_CMD_PID, 1, CG_ATTR_PID, (void *) &pid, sizeof(u_int32_t));
+    u32t pid = getpid();
+    return genl_send_msg(fd, fid, pid, CG_CMD_PID, 1, CG_ATTR_PID, (void *) &pid, sizeof(u32t));
 }
 
-int rcv_msg(u_int16_t fid, int sock, struct packet *data)
+int rcv_msg(u16t fid, int sock, struct packet *data)
 {
 	int ret;
 	nlmsg msg;
@@ -104,7 +104,7 @@ int rcv_msg(u_int16_t fid, int sock, struct packet *data)
 	return 0;
 }
 
-int snd_msg(u_int16_t fid, int fd, struct packet *data)
+int snd_msg(u16t fid, int fd, struct packet *data)
 {
 	return genl_send_msg(fd, fid, getpid(), CG_CMD_PACKET, 1, CG_ATTR_PACKET, (void *) data, sizeof(struct packet));
 }
@@ -155,11 +155,28 @@ err:
     return -1;
 }
 
-int cg_main()
+int cg_key(int fid, int sock)
+{
+        struct packet data;
+        while (true) {
+                memset(&data, 0, sizeof(data)); 
+                if (!rcv_msg(fid, sock, &data)) {
+                        printf("Enc=%d,id=%u,len=%u\n", data.enc, data.id, data.len);
+                        if (data.enc) {
+                                // Encrypt
+                        } else {
+                                // Decrypt
+                        }
+                        memset(data.data, 0, data.len);
+                        snd_msg(fid, sock, &data);
+                }
+        }
+}
+
+void cg_main()
 {
 	int ret, fid, sock;
 	struct sockaddr_nl saddr;
-	struct packet data;
 
 	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (sock < 0) {
@@ -181,15 +198,9 @@ int cg_main()
 		ret = -1;
 		goto err;
 	}
-	if ((ret=set_pid(sock, fid)) < 0) {
-		goto err;
+	if ((ret=set_pid(sock, fid)) >= 0) {
+		cg_key(fid, sock);
 	}
-
-	if (!rcv_msg(fid, sock, &data)) {
-		printf("Enc=%d,id=%u,len=%u\n", data.enc, data.id, data.len);
-		snd_msg(fid, sock, &data);
-	}
-
 err:
 	close(sock);
 	return ret;
@@ -197,5 +208,5 @@ err:
 
 int main(int argc, char **argv)
 {
-	return cg_main();
+	cg_main();
 }
