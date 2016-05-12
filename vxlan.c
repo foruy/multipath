@@ -159,10 +159,14 @@ struct vxlan_dev {
 #define VXLAN_F_L3MISS	0x10
 #define VXLAN_F_IPV6	0x20 /* internal flag */
 
-enum {
+enum attrs {
         CG_ATTR_UNSPEC,
         CG_ATTR_PID,
+        CG_ATTR_DEVNUM,
         CG_ATTR_PACKET,
+        CG_ATTR_ADDR,
+        CG_ATTR_VALID, 
+        CG_ATTR_RATIO,
         __CG_ATTR_MAX,
 };
 
@@ -177,6 +181,7 @@ enum commands {
 #define CG_CMD_MAX (__CG_CMD_MAX - 1)
 
 static pid_t pid;
+static u16 devnum;
 int send_upcall(void *, int, enum commands);
 
 
@@ -1213,9 +1218,8 @@ error:
 #define CG_VNI 0
 #define MAX_SIZE (1 << 16)
 #define ST_SIZE(hdr) sizeof(struct hdr)
-static int SPLIT = 2;
 
-struct devpair {
+/*struct devpair {
     __be32 addr;
     bool valid;
 };
@@ -1240,12 +1244,15 @@ struct devpair local_pairs[] = {
      .addr = 2886730293,
      .valid = true,
     },
-};
+};*/
 
 struct padding {
     __be32 id;
-    __be32 offset;
-    __be32 block;
+    __be16 offset; // packet partial offset
+    __be16 block;  // packet total block number
+    __be16 ratio;  // packet ratio size
+    __be16 sid;    // source host id
+    __be16 did;    // destionation host id
     __be32 totlen;
 };
 
@@ -1255,15 +1262,38 @@ struct packet_list {
     spinlock_t buf_lock;
 };
 
-#define MAX_BUF_SIZE 2000
+#define MAX_BUF_SIZE 1800
 
 struct packet {
 	__u32 id;
 	__u32 ifindex;
 	__u16 len;
+	__u16 sid;
+	__u16 did;
 	bool enc;
 	char data[MAX_BUF_SIZE];
 };
+
+struct netable {
+        __u32 id;
+        __u16 idx;
+        __u32 addr;
+        __u32 ratio;
+        bool local;
+        bool valid;
+};
+
+struct devpair {
+	__be32 addr;
+	__be32 ratio;
+	bool valid;
+};
+
+#define MAX_DEVICE 10 /* max device number */
+#define MAX_SCALE 255 /* how lager scale host */
+
+static struct devpair local_pair[MAX_DEVICE];
+static struct devpair remote_pair[MAX_SCALE][MAX_DEVICE];
 
 struct buffer {
     struct hlist_node hlist;
@@ -1292,7 +1322,7 @@ static int buf_get(struct packet_list *pt, struct full_buffer *fbuf, u16 id, u32
     hlist_for_each_entry_rcu(b, buf_head(pt, id), hlist) {
         if ((b->pad.id & 0x0000ffff) == id) {
             struct full_buffer fb;
-            if (b->pad.offset > (SPLIT + 1))
+            if (b->pad.offset > MAX_DEVICE)
                 return 0;
 
             fb.data = b->data;
@@ -1339,7 +1369,8 @@ static void buf_cleanup(unsigned long arg)
 }
 
 static void recombine(struct sk_buff *old_skb, struct vxlan_dev *vxlan,
-                      struct full_buffer *fbuf, u32 id, int count, u32 totlen)
+                      struct full_buffer *fbuf, u32 id, int count, u32 totlen,
+                      struct padding *pad)
 {
 	int i;
 	struct packet pack;
@@ -1355,6 +1386,8 @@ static void recombine(struct sk_buff *old_skb, struct vxlan_dev *vxlan,
 		pack.id = id;
 		pack.enc = false;
 		pack.ifindex = vxlan->dev->ifindex;
+		pack.sid = pad->sid;
+		pack.did = pad->did;
 
 		send_upcall((void *) &pack, sizeof(pack), CG_CMD_PACKET);
 	}
@@ -1429,8 +1462,8 @@ static void _vxlan_rcv(struct packet_list *pt, struct sk_buff *skb,
     int count;
     u32 totlen = 0;
     struct buffer *buf;
-    struct full_buffer fbuf[SPLIT + 1];
-    memset(fbuf, 0, ST_SIZE(full_buffer) * (SPLIT + 1));
+    struct full_buffer fbuf[MAX_DEVICE + 1];
+    memset(fbuf, 0, ST_SIZE(full_buffer) * (MAX_DEVICE + 1));
 
     buf = kmalloc(sizeof(*buf), GFP_ATOMIC);
     if (buf == NULL) {
@@ -1452,7 +1485,7 @@ static void _vxlan_rcv(struct packet_list *pt, struct sk_buff *skb,
     spin_unlock_bh(&pt->buf_lock);
 
     if (count > 0 && totlen > 0) {
-        recombine(skb, vxlan, fbuf, pad->id, count, totlen);
+        recombine(skb, vxlan, fbuf, pad->id, count, totlen, pad);
 	buf_delete(&ptable, pad->id);
 	}
 }
@@ -2102,10 +2135,10 @@ static void vxlan_encap_bypass(struct sk_buff *skb, struct vxlan_dev *src_vxlan,
 	}
 }
 
-static struct rtable *rt_select(struct net *net, struct flowi4 *fl, __be32 ost)
+static struct rtable *rt_select(struct net *net, struct flowi4 *fl, __be16 ost, u16 id)
 {
     int count = 0;
-    int len = ARRAY_SIZE(local_pairs);
+    int len = devnum;
     int mod = ost % len;
     struct rtable *rt = NULL;
 
@@ -2113,9 +2146,9 @@ static struct rtable *rt_select(struct net *net, struct flowi4 *fl, __be32 ost)
         goto empty;
 
     do {
-        if (local_pairs[mod].valid && remote_pairs[mod].valid) {
-            fl->daddr = htonl(remote_pairs[mod].addr);
-            fl->saddr = htonl(local_pairs[mod].addr);
+        if (local_pair[mod].valid && remote_pair[id][mod].valid) {
+            fl->daddr = remote_pair[id][mod].addr;
+            fl->saddr = local_pair[mod].addr;
             rt = ip_route_output_key(net, fl);
             if (!IS_ERR(rt) && netif_running(rt->dst.dev)) {
                 return rt;
@@ -2135,7 +2168,7 @@ empty:
 
 int _vxlan_xmit_skb(struct vxlan_dev *vxlan, __u8 tos, __u8 ttl, __be16 df,
 		    __be16 src_port, __be16 dst_port, __be32 vni, unsigned char *buf,
-                    __be32 id, __be32 ost, __be32 block, int len)
+                    __be16 ost, __be16 block, int len, struct packet *pack)
 {
     struct sk_buff *skb;
     struct vxlanhdr *vxh;
@@ -2147,7 +2180,7 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, __u8 tos, __u8 ttl, __be16 df,
     struct rtable *rt;
 
     memset(&fl4, 0, sizeof(fl4));
-    rt = rt_select(sock_net(vxlan->vn_sock->sock->sk), &fl4, ost);
+    rt = rt_select(sock_net(vxlan->vn_sock->sock->sk), &fl4, ost, pack->did);
     if (IS_ERR(rt) || rt == NULL) {
         netdev_dbg(vxlan->dev, "no route to %pI4\n", &fl4.daddr);
         vxlan->dev->stats.tx_carrier_errors++;
@@ -2177,9 +2210,11 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, __u8 tos, __u8 ttl, __be16 df,
     skb->len += len;
 
     pad = (struct padding *) __skb_push(skb, ST_SIZE(padding));
-    pad->id = id;
+    pad->id = pack->id;
     pad->offset = ost;
     pad->block = block;
+    pad->sid = pack->sid;
+    pad->did = pack->did;
     pad->totlen = VXLAN_FLAGS;
 
     vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
@@ -2201,7 +2236,7 @@ int _vxlan_xmit_skb(struct vxlan_dev *vxlan, __u8 tos, __u8 ttl, __be16 df,
                 ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
 
 
-	pr_warn("Send id=%u,ost=%u,len=%u,skblen=%u\n", id, ost, len, skb->len);
+	pr_warn("Send id=%u,ost=%u,len=%u,skblen=%u\n", pack->id, ost, len, skb->len);
     err = iptunnel_xmit(rt, skb, fl4.saddr, fl4.daddr, IPPROTO_UDP, tos, ttl, df, false);
     if (err >= 0)
         goto drop;
@@ -2214,7 +2249,7 @@ drop:
     return err;
 }
 
-static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev)
+static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev, const struct iphdr *iph)
 {
 	u32 id;
 	struct packet pack;
@@ -2229,6 +2264,8 @@ static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev)
 	pack.len = skb->len;
 	pack.enc = true;
 	pack.ifindex = dev->ifindex;
+	pack.sid = (iph->saddr >> 16) & 0x00ff;
+	pack.did = (iph->daddr >> 16) & 0x00ff;
 
 	send_upcall((void *) &pack, sizeof(pack), CG_CMD_PACKET);
 }
@@ -2252,7 +2289,7 @@ static int _vxlan_xmit_one(struct net_device *dev, struct packet *pack)
 
 	int len, ret;
 	unsigned char *buf;
-	__be32 ost, block = SPLIT;
+	__be16 ost, block = devnum;
 	int _div = pack->len / block;
 	int _mod = pack->len % block;
 
@@ -2278,7 +2315,7 @@ static int _vxlan_xmit_one(struct net_device *dev, struct packet *pack)
 			len = _div;
 
 		ret = _vxlan_xmit_skb(vxlan, tos, ttl, df, src_port, dst_port,
-				vni, buf, pack->id, ost, block, len);
+				vni, buf, ost, block, len, pack);
 
 		if (ret < 0 || (ost == block))
 			break;
@@ -2288,30 +2325,76 @@ static int _vxlan_xmit_one(struct net_device *dev, struct packet *pack)
 	return 0;
 }
 
-static int do_packet(struct sk_buff *skb, struct genl_info *info)
+static int vxlan_packet_one(int len, struct packet *pack)
 {
-	int len, ret;
-	struct packet pack;
-	struct nlattr **a = info->attrs;
+	int ret;
 	struct net_device *dev = NULL;
 
-	if (!a[CG_ATTR_PACKET]) {
-		return -EINVAL;
-	}
+	pr_warn("Enc=%d,id=%u,len=%u,ifidx=%u\n", pack->enc, pack->id, pack->len, pack->ifindex);
 
-	len = nla_len(a[CG_ATTR_PACKET]);
-	nla_memcpy(&pack, a[CG_ATTR_PACKET], len);
-
-	pr_warn("Enc=%d,id=%u,len=%u,ifidx=%u\n", pack.enc, pack.id, pack.len, pack.ifindex);
-
-	dev = __dev_get_by_index(&init_net, pack.ifindex);
+	dev = __dev_get_by_index(&init_net, pack->ifindex);
 	if (!dev)
 		return -EADDRNOTAVAIL;
 
-	if (pack.enc)
-		ret = _vxlan_xmit_one(dev, &pack);
+	if (pack->enc)
+		ret = _vxlan_xmit_one(dev, pack);
 	else
-		ret = _vxlan_rcv_one(dev, &pack);
+		ret = _vxlan_rcv_one(dev, pack);
+
+	return ret;
+}
+
+static void set_addr(struct netable *nt)
+{
+	if (nt->local) {
+		local_pair[nt->idx].addr = nt->addr;
+		local_pair[nt->idx].valid = nt->valid;
+	} else {
+		remote_pair[nt->id][nt->idx].addr = nt->addr;
+	}
+}
+
+static void set_valid(struct netable *nt)
+{
+	remote_pair[nt->id][nt->idx].valid = nt->valid;
+}
+
+static void set_ratio(struct netable *nt)
+{
+	local_pair[nt->idx].ratio = nt->ratio;
+}
+
+static int do_packet(struct sk_buff *skb, struct genl_info *info)
+{
+        int len, ret = 0;
+        struct nlattr **a = info->attrs;
+
+        if (a[CG_ATTR_PACKET]) {
+                struct packet pack;
+                len = nla_len(a[CG_ATTR_PACKET]);
+                nla_memcpy(&pack, a[CG_ATTR_PACKET], len);
+                ret = vxlan_packet_one(len, &pack);
+        } else {
+                struct netable nt;
+                memset(&nt, 0, sizeof(nt));
+
+                if (a[CG_ATTR_ADDR]) {
+                        len = nla_len(a[CG_ATTR_ADDR]);
+                        nla_memcpy(&nt, a[CG_ATTR_ADDR], len);
+                        set_addr(&nt);
+                } else if (a[CG_ATTR_VALID]) {
+                        len = nla_len(a[CG_ATTR_VALID]);
+                        nla_memcpy(&nt, a[CG_ATTR_VALID], len);
+                        set_valid(&nt);
+                } else if (a[CG_ATTR_RATIO]) {
+                        len = nla_len(a[CG_ATTR_RATIO]);
+                        nla_memcpy(&nt, a[CG_ATTR_RATIO], len);
+                        set_ratio(&nt);
+                } else {
+                        return -EINVAL;
+                }
+
+        }
 
 	return ret;
 }
@@ -2360,7 +2443,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 
 if (old_iph->protocol == IPPROTO_UDP ||
         old_iph->protocol == IPPROTO_TCP) {
-    send_packet_to_user(skb, dev);
+    send_packet_to_user(skb, dev, old_iph);
     goto tx_free;
 }
 
@@ -3446,16 +3529,23 @@ static struct pernet_operations vxlan_net_ops = {
 static int do_pid(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr **a = info->attrs;
-	pid = nla_get_u32(a[CG_ATTR_PID]);
-	if (!pid) {
-		return -EINVAL;
+	if (a[CG_ATTR_PID]) {
+		pid = nla_get_u32(a[CG_ATTR_PID]);
+		if (!pid)
+			return -EINVAL;
+		pr_warn("pid=%u\n", pid);
+	} else if (a[CG_ATTR_DEVNUM]) {
+		devnum = nla_get_u16(a[CG_ATTR_DEVNUM]);
+		if (!devnum)
+			return -EINVAL;
+		pr_warn("devnum=%u\n", devnum);
 	}
-	pr_warn("pid=%u\n", pid);
 	return 0;
 }
 
 static struct nla_policy cg_pid_policy[CG_ATTR_MAX + 1] = {
         [CG_ATTR_PID] = { .type = NLA_U32 },
+        [CG_ATTR_DEVNUM] = { .type = NLA_U16 },
 };
 
 static struct nla_policy cg_packet_policy[CG_ATTR_MAX + 1] = {

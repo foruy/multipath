@@ -68,7 +68,7 @@ JNIEXPORT void JNICALL Java_com_net_NetClient_close
 }
 #endif
 
-#define MAX_BUF_SIZE 2000
+#define MAX_BUF_SIZE 1800
 #define NAME "CG"
 
 #define GENLMSG_DATA(glh) ((void *)((char *)NLMSG_DATA(glh) + GENL_HDRLEN))

@@ -31,7 +31,9 @@ public class NetDevice {
     private String broadcast;
     private String[] fargs;
     private NetClient nc = null;
-    private Map<Integer,Map<Integer,NetTable>> netable = null;
+    private Map<Integer,Map<Integer,NetTable>> netable = new HashMap<Integer,Map<Integer,NetTable>>();
+	private static final int BUF_SIZE = 2048;
+	private static final int INTERNAL = 5000;
 	private Map<Integer,String> pub = new HashMap<Integer,String>();
 
 	public void setNC(NetClient nc) {
@@ -51,7 +53,7 @@ public class NetDevice {
     }
 
     public final void receive() throws IOException {
-        byte[] buffer = new byte[2048];
+        byte[] buffer = new byte[BUF_SIZE];
         DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
         dgs.receive(packet);
         ByteArrayInputStream baos = new ByteArrayInputStream(buffer);
@@ -63,17 +65,15 @@ public class NetDevice {
             while (entries.hasNext()) {
                 Map.Entry<Integer,Map<Integer,NetTable>> entry = entries.next();
 		String pubAddr = pub.get(entry.getKey());
-		if (pubAddr == null || packet.getAddress().getHostAddress().equals(pubAddr)) {
+		if (pubAddr == null || !packet.getAddress().getHostAddress().equals(pubAddr)) {
 			pub.put(entry.getKey(), packet.getAddress().getHostAddress());
 		}
 	        if (entry.getKey() == id) continue;
-                System.out.println("Packet from>> " + packet.getAddress());
-                if (!netable.containsKey(entry.getKey())) {
-                    netable.put(entry.getKey(), entry.getValue());
-                } else {
-                    for (Map.Entry<Integer,NetTable> ntMap : entry.getValue().entrySet()) {
+                if (!netable.containsKey(entry.getKey()))
+                    netable.put(entry.getKey(), new HashMap<Integer,NetTable>());
+
+                for (Map.Entry<Integer,NetTable> ntMap : entry.getValue().entrySet()) {
                         update(entry.getKey(), ntMap.getKey(), ntMap.getValue().getAddr());
-                    }
                 }
             }
         } catch (Exception e) {
@@ -82,11 +82,15 @@ public class NetDevice {
     }
 
     public void clientSend(String host) {
+	Map<Integer,NetTable> item = netable.get(id);
+	if (item == null) return;
+	Map<Integer,Map<Integer,NetTable>> data = new HashMap<Integer,Map<Integer,NetTable>>();
+	data.put(id, item);
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         ObjectOutputStream oos = null;
         try {
             oos = new ObjectOutputStream(baos);
-            oos.writeObject(netable);
+            oos.writeObject(data);
             oos.flush();
         } catch (IOException e) {
             e.printStackTrace();
@@ -143,17 +147,20 @@ public class NetDevice {
         }
 
         Map<Integer,NetTable> ntMap = netable.get(id);
-        if (ntMap != null) {
             NetTable nt = ntMap.get(idx);
+	    boolean local = (id == this.id);
+	    boolean valid = !"".equals(value);
             if (nt == null) {
-                nt = new NetTable(value, "".equals(value) ? false : true);
+                // update kernel
+		if (nc.setAddr(id, idx, local, value, valid) == 0) {
+			if (nc.setValid(id, idx, valid) == 0)
+			    ntMap.put(idx, new NetTable(value, valid));
+		}
             } else if (!value.equals(nt.getAddr())) {
                 // update kernel
-		boolean local = (id == this.id);
-		if (nc.setAddr(id, idx, local, value) == 0)
-                nt.setAddr(value);
+		if (nc.setAddr(id, idx, local, value, valid) == 0)
+                	nt.setAddr(value);
             }
-        }
     }
 
     protected void ping() {
@@ -162,13 +169,14 @@ public class NetDevice {
                 continue;
             }
 
+            System.out.println("Status:");
             for (Map.Entry<Integer,NetTable> entry : entries.getValue().entrySet()) {
                 NetTable nt = entry.getValue();
                 if (!"".equals(nt.getAddr())) {
                     boolean stat = false;
                     try {
                         stat = InetAddress.getByName(nt.getAddr()).isReachable(TIMEOUT);
-                        System.out.printf("Status>> %s/%s\n", nt.getAddr(), stat ? "Active" : "Down");
+                        System.out.printf("  IP:%s -> ST:%s\n", nt.getAddr(), stat ? "Active" : "Down");
                     } catch (UnknownHostException ue) {
                         System.out.printf("unknown host: %s\n", nt.getAddr());
                     } catch (IOException ie) {
@@ -189,8 +197,9 @@ public class NetDevice {
         net.remove("lo");
 
         if (!flag) {
+            System.out.println("Network Table:");
             for (Map.Entry<Integer,Map<Integer,NetTable>> entry : netable.entrySet())
-                System.out.println("Network Table>> " + entry.getKey() + ":" + entry.getValue());
+                System.out.println("  ID:" + entry.getKey() + " -> IP:" + entry.getValue().values());
         }
         for (int i=0; i<names.length; i++) {
             String ip = "";
@@ -243,12 +252,7 @@ public class NetDevice {
 		System.exit(-1);
 	}
 
-        netable = new HashMap<Integer,Map<Integer,NetTable>>();
-        Map<Integer,NetTable> nt = new HashMap<Integer,NetTable>();
-        for (int i=0;i<fargs.length;i++) {
-            nt.put(i, new NetTable("", true));
-        }
-        netable.put(id, nt);
+        netable.put(id, new HashMap<Integer,NetTable>());
         checkLocal(fargs, true);
 
 	try {
@@ -267,7 +271,7 @@ public class NetDevice {
                 checkLocal(fargs, false);
                 ping();
             }
-        }, 1000, 5000);
+        }, INTERNAL, 5000);
 
 	new Thread() {
 		@Override

@@ -1,9 +1,7 @@
-ip link add br-gw type bridge
-brctl addif br-gw eth0
 rmmod vxlan
 insmod vxlan.ko
 ip link add vxlan0 type vxlan id 10 dstport 4789
-brctl addif br-gw vxlan0
+brctl addbr brgw
+brctl addif brgw vxlan0
+ifconfig brgw up
 ifconfig vxlan0 up
-ifconfig eth1 172.16.1.2/24 up
-ifconfig eth2 172.16.2.2/24 up

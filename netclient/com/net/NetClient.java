@@ -36,10 +36,11 @@ public class NetClient {
 		return setnum(fd, num);
 	}
 
-	public int setAddr(int id, int idx, boolean local, String addr) {
+	public int setAddr(int id, int idx, boolean local, String addr, boolean valid) {
 		NetType nType = new NetType(id, idx);
 		nType.local = local;
 		nType.addr = addr;
+		nType.valid = valid;
 		return set(fd, nType.CONST_ADDRESS, nType);
 	}
 

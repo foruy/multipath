@@ -94,7 +94,6 @@ static int create_sock()
         }
 
 	fid = get_fid(sock, NAME);
-printf("fid=%u\n", fid);
 	if (!fid) {
 		printf("failed to get family id\n");
 		close(sock);
@@ -244,13 +243,17 @@ JNIEXPORT jint JNICALL Java_com_net_NetClient_set
 	jstring jstraddr = (*env)->GetObjectField(env, jtype, jaddr);
 	const char *addr = (*env)->GetStringUTFChars(env, jstraddr, 0);
 	struct in_addr sin_addr;
-	if (!inet_aton(addr, &sin_addr)) {
+
+	if (strlen(addr)) {
+	    if (!inet_aton(addr, &sin_addr)) {
 		perror("failed to run inet_aton");
 		return -1;
+	    }
+	} else {
+		sin_addr.s_addr = 0;
 	}
 	(*env)->ReleaseStringUTFChars(env, jstraddr, addr);
 
-	printf("long addr=%u\n", sin_addr.s_addr);
 	nt.addr = sin_addr.s_addr;
 
 	return send_msg(jfd, fid, getpid(), CG_CMD_PACKET, 1, atype, (void *) &nt, sizeof(struct netable));

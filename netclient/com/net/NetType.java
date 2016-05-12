@@ -17,7 +17,7 @@ public class NetType {
 		this.id = id;
 		this.idx = idx;
 		this.addr = "";
-		this.ratio = 0;
+		this.ratio = 1;
 		this.local = false;
 		this.valid = false;
 	}
