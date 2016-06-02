@@ -2249,6 +2249,12 @@ drop:
     return err;
 }
 
+// Parsing node id from ip address.
+int get_node_id(u32 addr)
+{
+	return (addr >> 16) & 0x00ff;
+}
+
 static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev, const struct iphdr *iph)
 {
 	u32 id;
@@ -2264,8 +2270,8 @@ static void send_packet_to_user(struct sk_buff *skb, struct net_device *dev, con
 	pack.len = skb->len;
 	pack.enc = true;
 	pack.ifindex = dev->ifindex;
-	pack.sid = (iph->saddr >> 16) & 0x00ff;
-	pack.did = (iph->daddr >> 16) & 0x00ff;
+	pack.sid = get_node_id(iph->saddr);
+	pack.did = get_node_id(iph->daddr);
 
 	send_upcall((void *) &pack, sizeof(pack), CG_CMD_PACKET);
 }
@@ -2349,6 +2355,7 @@ static void set_addr(struct netable *nt)
 	if (nt->local) {
 		local_pair[nt->idx].addr = nt->addr;
 		local_pair[nt->idx].valid = nt->valid;
+		local_pair[nt->idx].ratio = nt->ratio;
 	} else {
 		remote_pair[nt->id][nt->idx].addr = nt->addr;
 	}
@@ -2412,6 +2419,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 	__be16 df = 0;
 	__u8 tos, ttl;
 	int err;
+	__be32 dip;
 
 	dst_port = rdst->remote_port ? rdst->remote_port : vxlan->dst_port;
 	vni = rdst->remote_vni;
@@ -2427,6 +2435,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 //	}
 
 	old_iph = ip_hdr(skb);
+	dip = old_iph->daddr;
 
 	ttl = vxlan->ttl;
 	if (!ttl && vxlan_addr_multicast(dst))
@@ -2449,14 +2458,20 @@ if (old_iph->protocol == IPPROTO_UDP ||
 
 		memset(&fl4, 0, sizeof(fl4));
 		//fl4.flowi4_oif = rdst->remote_ifindex;
-		fl4.flowi4_tos = RT_TOS(tos);
 		//fl4.daddr = dst->sin.sin_addr.s_addr;
 		//fl4.saddr = vxlan->saddr.sin.sin_addr.s_addr;
-		fl4.daddr = htonl(2886730038);
-		fl4.saddr = htonl(2886730037);
+		//rt = ip_route_output_key(dev_net(dev), &fl4);
+		fl4.flowi4_tos = RT_TOS(tos);
+		if (!devnum) goto tx_error;
+		if (ntohs(eth_hdr(skb)->h_proto) == ETH_P_ARP) {
+			const struct arphdr *parp = arp_hdr(skb);
+			u8 *arpptr = (u8 *) parp + sizeof(struct arphdr);
+			arpptr += (2 * ETH_ALEN + sizeof(dip));
+			memcpy(&dip, arpptr, sizeof(dip));
+		}
 
-		rt = ip_route_output_key(dev_net(dev), &fl4);
-		if (IS_ERR(rt)) {
+		rt = rt_select(dev_net(dev), &fl4, (old_iph->id % devnum), get_node_id(dip));
+		if (IS_ERR(rt) || rt == NULL) {
 			netdev_dbg(dev, "no route to %pI4\n",
 				   &dst->sin.sin_addr.s_addr);
 			dev->stats.tx_carrier_errors++;
