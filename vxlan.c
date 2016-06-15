@@ -1344,8 +1344,10 @@ static void buf_delete(struct packet_list *pt, u16 id)
     struct hlist_node *p, *n; 
     hlist_for_each_safe(p, n, buf_head(pt, id)) { 
         struct buffer *b = container_of(p, struct buffer, hlist);
-        hlist_del_rcu(&b->hlist);
-        kfree(b);
+        if (b != NULL) {
+            hlist_del_rcu(&b->hlist);
+            kfree(b);
+        }
     }
 }
 
@@ -1482,12 +1484,12 @@ static void _vxlan_rcv(struct packet_list *pt, struct sk_buff *skb,
     hlist_add_head_rcu(&buf->hlist, buf_head(pt, pad->id));
 
     count = buf_get(pt, fbuf, pad->id, &totlen);
-    spin_unlock_bh(&pt->buf_lock);
 
     if (count > 0 && totlen > 0) {
         recombine(skb, vxlan, fbuf, pad->id, count, totlen, pad);
-	buf_delete(&ptable, pad->id);
-	}
+        buf_delete(pt, pad->id);
+    }
+    spin_unlock_bh(&pt->buf_lock);
 }
 /********************wwx end*********************/
 
