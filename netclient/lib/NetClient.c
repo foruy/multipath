@@ -198,11 +198,12 @@ JNIEXPORT void JNICALL Java_com_net_NetClient_send(JNIEnv *env, jclass obj, jint
 	pack.enc = (*env)->GetBooleanField(env, jmsg, jenc);
 	jbyteArray data = (*env)->GetObjectField(env, jmsg, jdata);
 	//pack.data = (*env)->GetByteArrayElements(env, data, JNI_FALSE);
-	memcpy(pack.data, (*env)->GetByteArrayElements(env, data, JNI_FALSE), pack.len);
+    jbyte *bd = (*env)->GetByteArrayElements(env, data, JNI_FALSE);
+	memcpy(pack.data, bd, pack.len);
 
 	send_msg(jfd, fid, getpid(), CG_CMD_PACKET, 1, CG_ATTR_PACKET, (void *) &pack, sizeof(struct packet));
 
-	//(*env)->ReleaseByteArrayElements(env, data, pack.data, JNI_ABORT);
+	(*env)->ReleaseByteArrayElements(env, data, bd, JNI_ABORT);
 }
 
 JNIEXPORT jint JNICALL Java_com_net_NetClient_set
